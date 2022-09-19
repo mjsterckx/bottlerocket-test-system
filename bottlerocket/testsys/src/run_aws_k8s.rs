@@ -170,6 +170,14 @@ pub(crate) struct RunAwsK8s {
     /// The arn for the role that should be assumed by the agents.
     #[structopt(long)]
     assume_role: Option<String>,
+
+    /// The list of accelerator manufacturers that can be used to filter instance types.
+    #[structopt(long)]
+    accelerator_manufacturers: Option<Vec<String>>,
+
+    /// The list of accelerator names that can be used to filter instance types.
+    #[structopt(long)]
+    accelerator_names: Option<Vec<String>>,
 }
 
 impl RunAwsK8s {
@@ -384,6 +392,8 @@ impl RunAwsK8s {
             cluster_dns_ip: Some(format!("${{{}.clusterDnsIp}}", cluster_resource_name)),
             security_groups: vec![],
             assume_role: self.assume_role.clone(),
+            accelerator_manufacturers: self.accelerator_manufacturers.clone(),
+            accelerator_names: self.accelerator_names.clone(),
         }
         .into_map()
         .context(error::ConfigMapSnafu)?;

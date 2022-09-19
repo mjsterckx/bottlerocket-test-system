@@ -3,8 +3,10 @@ use agent_utils::json_display;
 use aws_sdk_ec2::client::fluent_builders::RunInstances;
 use aws_sdk_ec2::error::RunInstancesError;
 use aws_sdk_ec2::model::{
-    ArchitectureValues, Filter, IamInstanceProfileSpecification, InstanceType, ResourceType, Tag,
-    TagSpecification,
+    AcceleratorManufacturer, AcceleratorName, ArchitectureType, ArchitectureValues, Filter,
+    IamInstanceProfileSpecification, Instance, InstanceRequirementsRequest, InstanceType,
+    MemoryMiBRequest, ResourceType, Tag, TagSpecification, VCpuCountRangeRequest,
+    VirtualizationType,
 };
 use aws_sdk_ec2::output::RunInstancesOutput;
 use aws_sdk_ec2::types::SdkError;
@@ -118,14 +120,85 @@ impl Create for Ec2Creator {
         .await?;
         let ec2_client = aws_sdk_ec2::Client::new(&shared_config);
 
-        // Determine the instance type to use. If provided use that one. Otherwise, for `x86_64` use `m5.large`
-        // and for `aarch64` use `m6g.large`
-        let instance_type = if let Some(instance_type) = spec.configuration.instance_type {
-            instance_type
+        // Determine the instance type to use. If provided use that one. Otherwise, if accelerator manufacturers or
+        // accelerator names are provided, compile a list of all instance types with those components.
+        // If those are also not specified, for `x86_64` use `m5.large` and for `aarch64` use `m6g.large`
+        let mut instance_types: Vec<String> = vec![];
+        if let Some(instance_type) = spec.configuration.instance_type {
+            instance_types.push(instance_type);
+        } else if (spec
+            .configuration
+            .accelerator_manufacturers
+            .clone()
+            .is_some()
+            && spec.configuration.accelerator_manufacturers.clone()?.len() > 0)
+            || (spec.configuration.accelerator_names.clone().is_some()
+                && spec.configuration.accelerator_names.clone()?.len() > 0)
+        {
+            let amis = ec2_client
+                .describe_images()
+                .image_ids(&spec.configuration.node_ami)
+                .send()
+                .await
+                .context(&memo, "Unable to get ami")?
+                .images
+                .context(&memo, "Unable to get ami")?;
+            let ami = amis.get(0).context(&memo, "Unable to get ami")?;
+            let ami_architecture = ami
+                .architecture
+                .clone()
+                .context(&memo, "Ami has no architecture")?;
+            let ami_virtualization = ami
+                .virtualization_type
+                .clone()
+                .context(&memo, "Ami has no virtualization")?;
+            let mut accelerator_manufacturers = vec![];
+            if let Some(manufacturers) = spec.configuration.accelerator_manufacturers {
+                for manufacturer in manufacturers {
+                    accelerator_manufacturers
+                        .push(AcceleratorManufacturer::from(manufacturer.as_str()));
+                }
+            }
+            let mut accelerator_names = vec![];
+            if let Some(names) = spec.configuration.accelerator_names {
+                for name in names {
+                    accelerator_names.push(AcceleratorName::from(name.as_str()));
+                }
+            }
+            // TODO: set region, acceleratorCount to 0 if no accelerator manufacturers or names
+            let instance_types_from_instance_requirements = ec2_client
+                .get_instance_types_from_instance_requirements()
+                .set_architecture_types(Some(vec![ArchitectureType::from(
+                    ami_architecture.as_str(),
+                )]))
+                .set_virtualization_types(Some(vec![VirtualizationType::from(
+                    ami_virtualization.as_str(),
+                )]))
+                .set_instance_requirements(Some(
+                    InstanceRequirementsRequest::builder()
+                        .set_v_cpu_count(Some(
+                            VCpuCountRangeRequest::builder().set_min(Some(0)).build(),
+                        ))
+                        .set_memory_mi_b(Some(MemoryMiBRequest::builder().set_min(Some(0)).build()))
+                        .set_accelerator_manufacturers(Some(accelerator_manufacturers))
+                        .set_accelerator_names(Some(accelerator_names))
+                        .build(),
+                ))
+                .send()
+                .await
+                .context(
+                    &memo,
+                    "No instance types found for given accelerator names and/or manufacturers",
+                )?;
+
+            for instance_type_info in instance_types_from_instance_requirements.instance_types? {
+                instance_types.push(instance_type_info.instance_type?);
+            }
         } else {
-            instance_type(&ec2_client, &spec.configuration.node_ami, &memo).await?
+            instance_types
+                .push(instance_type(&ec2_client, &spec.configuration.node_ami, &memo).await?);
         };
-        info!("Using instance type '{}'", instance_type);
+        info!("Using instance types '{:?}'", instance_types);
 
         // Run the ec2 instances
         let instance_count = spec
@@ -134,52 +207,75 @@ impl Create for Ec2Creator {
             .unwrap_or(DEFAULT_INSTANCE_COUNT);
         info!("Creating {} instance(s)", instance_count);
 
-        let run_instances = ec2_client
-            .run_instances()
-            .min_count(instance_count)
-            .max_count(instance_count)
-            .subnet_id(&spec.configuration.subnet_id)
-            .set_security_group_ids(Some(spec.configuration.security_groups.clone()))
-            .image_id(spec.configuration.node_ami)
-            .instance_type(InstanceType::from(instance_type.as_str()))
-            .tag_specifications(tag_specifications(
-                &spec.configuration.cluster_type,
-                &spec.configuration.cluster_name,
-                &instance_uuid,
-            ))
-            .user_data(userdata(
-                &spec.configuration.cluster_type,
-                &spec.configuration.cluster_name,
-                &spec.configuration.endpoint,
-                &spec.configuration.certificate,
-                &spec.configuration.cluster_dns_ip,
-                &memo,
-            )?)
-            .iam_instance_profile(
-                IamInstanceProfileSpecification::builder()
-                    .arn(&spec.configuration.instance_profile_arn)
-                    .build(),
-            );
+        let mut instances: Option<Vec<Instance>> = None;
+        for instance_type in instance_types {
+            let run_instances = ec2_client
+                .run_instances()
+                .min_count(instance_count)
+                .max_count(instance_count)
+                .subnet_id(&spec.configuration.subnet_id)
+                .set_security_group_ids(Some(spec.configuration.security_groups.clone()))
+                .image_id(&spec.configuration.node_ami)
+                .instance_type(InstanceType::from(instance_type.as_str()))
+                .tag_specifications(tag_specifications(
+                    &spec.configuration.cluster_type,
+                    &spec.configuration.cluster_name,
+                    &instance_uuid,
+                ))
+                .user_data(userdata(
+                    &spec.configuration.cluster_type,
+                    &spec.configuration.cluster_name,
+                    &spec.configuration.endpoint,
+                    &spec.configuration.certificate,
+                    &spec.configuration.cluster_dns_ip,
+                    &memo,
+                )?)
+                .iam_instance_profile(
+                    IamInstanceProfileSpecification::builder()
+                        .arn(&spec.configuration.instance_profile_arn)
+                        .build(),
+                );
 
-        info!("Starting instances");
-        let run_instance_result = tokio::time::timeout(
-            Duration::from_secs(360),
-            wait_for_successful_run_instances(&run_instances),
-        )
-        .await
-        .context(
-            Resources::Clear,
-            "Failed to run instances within the time limit",
-        )?;
+            info!("Starting instances of type {}", instance_type);
+            let run_instance_result = tokio::time::timeout(
+                Duration::from_secs(360),
+                wait_for_successful_run_instances(&run_instances),
+            )
+            .await
+            .context(
+                Resources::Clear,
+                "Failed to run instances within the time limit",
+            )?;
 
-        let instances = run_instance_result
-            .context(resources_situation(&memo), "Failed to create instances")?
-            .instances
-            .context(Resources::Remaining, "Results missing instances field")?;
+            match run_instance_result {
+                Ok(result) => {
+                    instances = Some(
+                        result
+                            .instances
+                            .context(Resources::Remaining, "Results missing instances field")?,
+                    );
+                    break;
+                }
+                Err(err) => {
+                    info!(
+                        "Failed to create instances of type {}: {:?}",
+                        instance_type, err
+                    );
+                }
+            }
+            // .context(resources_situation(&memo), "Failed to create instances")?
+        }
+        // TODO: error handling
+        if instances.is_none() {
+            return Err(ProviderError::new_with_context(
+                Resources::Clear,
+                "No instance types that have the specified components are available at this moment",
+            ));
+        }
         let mut instance_ids = HashSet::default();
 
         info!("Checking instance IDs");
-        for instance in instances {
+        for instance in instances.unwrap() {
             instance_ids.insert(instance.instance_id.clone().ok_or_else(|| {
                 ProviderError::new_with_context(
                     Resources::Remaining,

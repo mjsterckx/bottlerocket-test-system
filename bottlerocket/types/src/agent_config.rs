@@ -176,6 +176,12 @@ pub struct Ec2Config {
     /// The role that should be assumed when launching instances.
     pub assume_role: Option<String>,
 
+    /// The list of accelerator manufacturers that can be used to filter instance types.
+    pub accelerator_manufacturers: Option<Vec<String>>,
+
+    /// The list of accelerator names that can be used to filter instance types.
+    pub accelerator_names: Option<Vec<String>>,
+
     // Eks specific instance information.
     /// The security groups that should be attached to the instances.
     #[serde(default)]
