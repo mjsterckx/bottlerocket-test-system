@@ -71,6 +71,8 @@ EOF
 
 ### Workload Testing on `aws-ecs` Variants
 
+Before generating a workload test file, make sure the variables `WORKLOAD_TEST_NAME` and `WORKLOAD_TEST_IMAGE_URI` are set.
+
 _Note_: An example of a workload test that can be used with the `ecs-workload-agent` is the `nvidia-smoke` test. See the `nvidia-smoke` [README.md](../tests/workload/nvidia-smoke/README.md) for instructions on how to build and use its image.
 
 ```bash
@@ -190,6 +192,8 @@ EOF
 ### Migration Testing on `vmware-k8s` Variants
 
 This codeblock assumes that your vSphere config file has been sourced. Specifically, the variables `GOVC_USERNAME`, `GOVC_PASSWORD`, `GOVC_DATACENTER`, `GOVC_DATASTORE`, `GOVC_URL`, `GOVC_NETWORK`, `GOVC_RESOURCE_POOL`, and `GOVC_FOLDER` need to be populated.
+
+Additionally, make sure `CONTROL_PLANE_ENDPOINT_IP` and `MGMT_CLUSTER_KUBECONFIG_PATH` are set.
 
 ```bash
 CONTROL_PLANE_ENDPOINT_IP=
